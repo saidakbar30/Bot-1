@@ -1,174 +1,132 @@
-
 # -*- coding: utf-8 -*-
 """
-👑 admin.py — admin qismi (bot.py bilan bir papkada turishi kerak)
-
-Imkoniyatlar: /admin → statistika, hammaga xabar yuborish, matnlarni o'zgartirish.
-Admin ID raqami: ADMIN_ID (Secrets yoki shu fayl).
+🚗 user.py — foydalanuvchi qismi (bot.py va admin.py bilan bir papkada)
 """
 
-import asyncio
 import logging
-import os
-import sqlite3
-import time
-from datetime import datetime
-
-from aiogram import BaseMiddleware, F, Router
-from aiogram.filters import Command
+from aiogram import Bot, F, Router
+from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, KeyboardButton, Message, ReplyKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+from admin import ADMIN_IDS, BTN_ADMIN, get_text
+
 # ===================== SOZLAMALAR =====================
-ADMIN_ID = os.getenv("ADMIN_ID", "123456789")   # bir nechta bo'lsa vergul bilan: 111,222
-DB_PATH = "bot.db"
-BTN_ADMIN = "👑 Admin panel"
+CHANNEL = "@Qumtepa_karburator"        # Majburiy obuna kanali
+LAT, LON = 40.453972, 71.663417        # Ustaxona lokatsiyasi
 
-ADMIN_IDS = [int(i) for i in ADMIN_ID.replace(" ", "").split(",") if i.isdigit()]
+BTN_ABOUT = "🛠 Karburator haqida"
+BTN_ADDRESS = "📍 Ustaxona manzili"
+BTN_PRICES = "💰 Barcha narxlar"
+BTN_HOURS = "⏰ Ish vaqti"
 
-# bot.py shu lug'atni to'ldiradi: kalit -> (menyudagi nomi, standart matn)
-TEXTS = {}
-
-log = logging.getLogger("admin")
-
-# ===================== BAZA =====================
-db = sqlite3.connect(DB_PATH, check_same_thread=False)
-db.executescript("""
-CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, joined INTEGER);
-CREATE TABLE IF NOT EXISTS texts (key TEXT PRIMARY KEY, value TEXT);
-""")
-db.commit()
+user_router = Router()
+log = logging.getLogger("user")
 
 
-def get_text(key: str) -> str:
-    """Admin o'zgartirgan matn bo'lsa shuni, bo'lmasa standartini qaytaradi."""
-    row = db.execute("SELECT value FROM texts WHERE key=?", (key,)).fetchone()
-    return row[0] if row else TEXTS[key][1]
+def menu_kb(user_id: int) -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text=BTN_ABOUT)],
+        [KeyboardButton(text=BTN_ADDRESS), KeyboardButton(text=BTN_PRICES)],
+        [KeyboardButton(text=BTN_HOURS)],
+    ]
+    if user_id in ADMIN_IDS:
+        rows.append([KeyboardButton(text=BTN_ADMIN)])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
-def set_text(key: str, value: str):
-    db.execute("INSERT OR REPLACE INTO texts VALUES (?,?)", (key, value))
-    db.commit()
-
-
-def reset_text(key: str):
-    db.execute("DELETE FROM texts WHERE key=?", (key,))
-    db.commit()
-
-
-class RegisterMiddleware(BaseMiddleware):
-    """Har bir foydalanuvchini bazaga yozib boradi (statistika va xabar yuborish uchun)."""
-    async def __call__(self, handler, event, data):
-        u = getattr(event, "from_user", None)
-        if u:
-            db.execute("INSERT OR IGNORE INTO users VALUES (?,?)", (u.id, int(time.time())))
-            db.commit()
-        return await handler(event, data)
-
-
-# ===================== ADMIN =====================
-admin_router = Router()
-is_admin = F.from_user.id.in_(ADMIN_IDS)
-
-
-class AdminFSM(StatesGroup):
-    broadcast = State()
-    new_text = State()
-
-
-def admin_kb():
+def sub_kb():
     b = InlineKeyboardBuilder()
-    b.button(text="📊 Statistika", callback_data="adm:stats")
-    b.button(text="📢 Xabar yuborish", callback_data="adm:bc")
-    b.button(text="✏️ Matnlarni o'zgartirish", callback_data="adm:edit")
+    b.button(text="📢 Kanalga obuna bo'lish", url=f"https://t.me/{CHANNEL.lstrip('@')}")
+    b.button(text="✅ Tekshirish", callback_data="check_sub")
     b.adjust(1)
     return b.as_markup()
 
 
-@admin_router.message(Command("cancel"), is_admin)
-async def cmd_cancel(message: Message, state: FSMContext):
+async def is_subscribed(bot: Bot, user_id: int) -> bool:
+    if user_id in ADMIN_IDS:
+        return True
+    try:
+        member = await bot.get_chat_member(CHANNEL, user_id)
+        return member.status not in ("left", "kicked")
+    except Exception as e:
+        log.error("Obunani tekshirib bo'lmadi (%s): %s", CHANNEL, e)
+        return True
+
+
+async def ask_subscription(message: Message):
+    await message.answer(
+        "🔒 <b>Botdan foydalanish uchun kanalimizga obuna bo'ling:</b>\n\n"
+        f"📢 {CHANNEL}\n\nObuna bo'lgach, <b>✅ Tekshirish</b> tugmasini bosing.",
+        reply_markup=sub_kb())
+
+
+async def show_menu(message: Message, user_id: int):
+    await message.answer(
+        "🚗 <b>Qumtepa Karburator</b> avto ustaxonasi botiga xush kelibsiz!\n\n"
+        "Kerakli bo'limni tanlang 👇", reply_markup=menu_kb(user_id))
+
+
+async def guard(message: Message) -> bool:
+    bot = message.bot
+    if await is_subscribed(bot, message.from_user.id):
+        return True
+    await ask_subscription(message)
+    return False
+
+
+@user_router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("❌ Bekor qilindi.")
+    bot = message.bot
+    if await is_subscribed(bot, message.from_user.id):
+        await show_menu(message, message.from_user.id)
+    else:
+        await ask_subscription(message)
 
 
-@admin_router.message(Command("admin"), is_admin)
-@admin_router.message(F.text == BTN_ADMIN, is_admin)
-async def admin_panel(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer("👑 <b>Admin panel</b>", reply_markup=admin_kb())
-
-
-@admin_router.callback_query(F.data.startswith("adm:"), is_admin)
-async def admin_actions(cb: CallbackQuery, state: FSMContext):
-    action = cb.data.split(":")[1]
-    await cb.answer()
-    if action == "stats":
-        total = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-        today = db.execute("SELECT COUNT(*) FROM users WHERE joined>=?", (midnight,)).fetchone()[0]
-        await cb.message.answer(
-            f"📊 <b>Statistika</b>\n\n👥 Jami foydalanuvchilar: <b>{total}</b>\n🆕 Bugun qo'shilgan: <b>{today}</b>")
-    elif action == "bc":
-        await state.set_state(AdminFSM.broadcast)
-        await cb.message.answer("📢 Hammaga yuboriladigan xabarni yuboring (matn, rasm yoki video).\n\nBekor qilish: /cancel")
-    elif action == "edit":
-        b = InlineKeyboardBuilder()
-        for key, (label, _) in TEXTS.items():
-            b.button(text=label, callback_data=f"edit:{key}")
-        b.adjust(2)
-        await cb.message.answer("✏️ Qaysi matnni o'zgartiramiz?", reply_markup=b.as_markup())
-
-
-@admin_router.callback_query(F.data.startswith("edit:"), is_admin)
-async def edit_choose(cb: CallbackQuery, state: FSMContext):
-    key = cb.data.split(":")[1]
-    await cb.answer()
-    if key not in TEXTS:
+@user_router.callback_query(F.data == "check_sub")
+async def cb_check(cb: CallbackQuery):
+    bot = cb.bot
+    if not await is_subscribed(bot, cb.from_user.id):
+        await cb.answer("❌ Siz hali obuna bo'lmadingiz!", show_alert=True)
         return
-    await state.set_state(AdminFSM.new_text)
-    await state.update_data(key=key)
-    b = InlineKeyboardBuilder()
-    b.button(text="♻️ Asl holatiga qaytarish", callback_data=f"reset:{key}")
-    await cb.message.answer("Hozirgi matn 👇")
-    await cb.message.answer(get_text(key))
-    await cb.message.answer(
-        "✏️ Yangi matnni yuboring (qalin/kursiv formatlash saqlanadi).\n\nBekor qilish: /cancel",
-        reply_markup=b.as_markup())
+    await cb.answer("✅ Rahmat!")
+    await show_menu(cb.message, cb.from_user.id)
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
 
 
-@admin_router.callback_query(F.data.startswith("reset:"), is_admin)
-async def edit_reset(cb: CallbackQuery, state: FSMContext):
-    key = cb.data.split(":")[1]
-    if key in TEXTS:
-        reset_text(key)
-    await state.clear()
-    await cb.answer("♻️ Asl holatiga qaytarildi", show_alert=True)
+@user_router.message(F.text == BTN_ABOUT)
+async def about(message: Message):
+    if await guard(message):
+        await message.answer(get_text("about"))
 
 
-@admin_router.message(AdminFSM.new_text, F.text, ~F.text.startswith("/"), is_admin)
-async def edit_save(message: Message, state: FSMContext):
-    key = (await state.get_data())["key"]
-    set_text(key, message.html_text)
-    await state.clear()
-    log.info("Admin %s matnni o'zgartirdi: %s", message.from_user.id, key)
-    await message.answer("✅ Matn yangilandi!")
+@user_router.message(F.text == BTN_ADDRESS)
+async def address(message: Message):
+    if await guard(message):
+        await message.answer(get_text("address"))
+        await message.answer_location(LAT, LON)
 
 
-@admin_router.message(AdminFSM.broadcast, is_admin)
-async def do_broadcast(message: Message, state: FSMContext):
-    await state.clear()
-    ids = [r[0] for r in db.execute("SELECT user_id FROM users").fetchall()]
-    await message.answer(f"📤 Yuborilmoqda... ({len(ids)} ta)")
-    ok = fail = 0
-    for uid in ids:
-        try:
-            await message.copy_to(uid)
-            ok += 1
-        except Exception:
-            fail += 1
-        await asyncio.sleep(0.05)
-    log.info("Broadcast: %s ok, %s fail", ok, fail)
-    await message.answer(f"✅ Yuborildi: <b>{ok}</b>\n❌ Yetmadi: <b>{fail}</b>")
-  
+@user_router.message(F.text == BTN_PRICES)
+async def prices(message: Message):
+    if await guard(message):
+        await message.answer(get_text("prices"))
+
+
+@user_router.message(F.text == BTN_HOURS)
+async def hours(message: Message):
+    if await guard(message):
+        await message.answer(get_text("hours"))
+
+
+@user_router.message(F.text)
+async def other(message: Message):
+    if await guard(message):
+        await message.answer("👇 Iltimos, menyudagi tugmalardan birini tanlang.",
+                             reply_markup=menu_kb(message.from_user.id))
